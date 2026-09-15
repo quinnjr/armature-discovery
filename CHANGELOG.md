@@ -9,10 +9,11 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
-### Fixed
+## [0.3.2] - 2026-09-15
 
-- **Breaking:** etcd registrations carry a lease with a keep-alive, and both keys are written in one transaction. Without a lease a crashed instance stayed discoverable forever — the opposite of finding healthy instances — and a partial write left a service discoverable but not deregisterable.
-- The default health probe reuses one HTTP client instead of building a fresh connection pool and TLS config per probe.
+### Changed
+
+- Dependencies bumped to their latest releases: `base64` 0.22 → 0.23, `tokio` 1.52 → 1.53.
 
 ## [0.3.1] - 2026-08-04
 
