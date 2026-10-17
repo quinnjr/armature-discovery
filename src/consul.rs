@@ -40,6 +40,40 @@ impl ConsulDiscovery {
         })
     }
 
+    /// Authenticate every request with a Consul ACL token (sent as
+    /// `X-Consul-Token`).
+    ///
+    /// Without a token, every call runs with Consul's anonymous policy; on a
+    /// cluster with ACLs enabled and a default-deny policy, registration and
+    /// discovery fail, and on one with a permissive anonymous policy anyone who
+    /// can reach the agent can register or deregister services.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// use armature_discovery::ConsulDiscovery;
+    ///
+    /// let consul = ConsulDiscovery::new("https://consul.internal:8501")?
+    ///     .with_acl_token(std::env::var("CONSUL_HTTP_TOKEN")?)?;
+    /// ```
+    pub fn with_acl_token(mut self, token: impl Into<String>) -> Result<Self, DiscoveryError> {
+        let mut value = reqwest::header::HeaderValue::from_str(&token.into()).map_err(|_| {
+            DiscoveryError::InvalidConfiguration(
+                "Consul ACL token is not a valid header value".to_string(),
+            )
+        })?;
+        // Keeps the token out of reqwest/hyper debug output.
+        value.set_sensitive(true);
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("X-Consul-Token", value);
+        self.client = reqwest::Client::builder()
+            .timeout(CONSUL_REQUEST_TIMEOUT)
+            .default_headers(headers)
+            .build()
+            .map_err(|e| DiscoveryError::InvalidConfiguration(e.to_string()))?;
+        Ok(self)
+    }
+
     /// Build `{base_url}/{segments...}`, percent-encoding each segment so
     /// caller-controlled values (service names/ids) can't inject extra
     /// path segments, query strings, or fragments into the request.
@@ -348,6 +382,34 @@ mod tests {
             req.path.contains("%2F") || !req.path.contains("../secret"),
             "service_name must be percent-encoded, not left as raw path syntax: {}",
             req.path
+        );
+    }
+
+    #[tokio::test]
+    async fn acl_token_is_sent_on_every_request() {
+        let server = StubServer::builder()
+            .default_response(StubResponse::json(200, "{}"))
+            .start()
+            .await;
+        let consul = ConsulDiscovery::new(server.url())
+            .unwrap()
+            .with_acl_token("s3cr3t-acl-token")
+            .unwrap();
+        let _ = consul.list_services().await;
+        let requests = server.requests();
+        assert_eq!(
+            requests[0].header("x-consul-token"),
+            Some("s3cr3t-acl-token")
+        );
+    }
+
+    #[test]
+    fn invalid_acl_token_is_rejected() {
+        assert!(
+            ConsulDiscovery::new("http://localhost:8500")
+                .unwrap()
+                .with_acl_token("bad\ntoken")
+                .is_err()
         );
     }
 }

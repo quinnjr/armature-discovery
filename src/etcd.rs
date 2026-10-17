@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use serde_json;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -56,11 +56,141 @@ struct Registration {
 /// then expire on their own, which is the intended behavior for a process
 /// that is shutting down.
 pub struct EtcdDiscovery {
-    base_url: String,
+    http: Arc<EtcdHttp>,
     prefix: String,
-    client: reqwest::Client,
     lease_ttl: Duration,
     registrations: Mutex<HashMap<String, Registration>>,
+}
+
+/// etcd v3 user credentials, for clusters with authentication enabled.
+/// `Debug` never prints the password.
+#[derive(Clone)]
+struct EtcdCredentials {
+    username: String,
+    password: String,
+}
+
+impl std::fmt::Debug for EtcdCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EtcdCredentials")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// The HTTP side of the client, shared with the keep-alive tasks so they
+/// authenticate the same way.
+struct EtcdHttp {
+    base_url: String,
+    client: reqwest::Client,
+    credentials: Option<EtcdCredentials>,
+    token: tokio::sync::RwLock<Option<String>>,
+}
+
+impl EtcdHttp {
+    /// POST `payload` to `{base_url}{path}`, attaching the auth token when
+    /// credentials are configured. A 401 (expired/invalidated token) triggers
+    /// one re-authentication and retry.
+    async fn post(
+        &self,
+        path: &str,
+        payload: &serde_json::Value,
+    ) -> Result<reqwest::Response, DiscoveryError> {
+        let response = self.send(path, payload).await?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED && self.credentials.is_some() {
+            self.authenticate().await?;
+            return self.send(path, payload).await;
+        }
+        Ok(response)
+    }
+
+    async fn send(
+        &self,
+        path: &str,
+        payload: &serde_json::Value,
+    ) -> Result<reqwest::Response, DiscoveryError> {
+        let mut request = self
+            .client
+            .post(format!("{}{}", self.base_url, path))
+            .json(payload);
+        if self.credentials.is_some() {
+            // Bind first: a read guard held across `authenticate` (which
+            // takes the write lock) would deadlock.
+            let cached = self.token.read().await.clone();
+            let token = match cached {
+                Some(token) => token,
+                None => self.authenticate().await?,
+            };
+            let mut value = reqwest::header::HeaderValue::from_str(&token).map_err(|_| {
+                DiscoveryError::InvalidConfiguration("etcd returned a malformed token".into())
+            })?;
+            value.set_sensitive(true);
+            request = request.header(reqwest::header::AUTHORIZATION, value);
+        }
+        Ok(request.send().await?)
+    }
+
+    /// Exchange the credentials for a token (`/v3/auth/authenticate`).
+    async fn authenticate(&self) -> Result<String, DiscoveryError> {
+        let Some(credentials) = &self.credentials else {
+            return Err(DiscoveryError::InvalidConfiguration(
+                "etcd credentials are not configured".into(),
+            ));
+        };
+        let response = self
+            .client
+            .post(format!("{}/v3/auth/authenticate", self.base_url))
+            .json(&serde_json::json!({
+                "name": credentials.username,
+                "password": credentials.password,
+            }))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            // The body is not echoed: it is not useful and the request
+            // carried a password.
+            return Err(DiscoveryError::InvalidConfiguration(format!(
+                "etcd authentication failed with status {}",
+                response.status()
+            )));
+        }
+        let body: serde_json::Value = response.json().await?;
+        let token = body["token"]
+            .as_str()
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| {
+                DiscoveryError::InvalidConfiguration("etcd authentication returned no token".into())
+            })?
+            .to_string();
+        *self.token.write().await = Some(token.clone());
+        Ok(token)
+    }
+}
+
+/// Reject service names that would break out of `{prefix}/{name}/` in the
+/// flat etcd keyspace.
+///
+/// etcd keys are plain byte strings scanned by prefix: `discover("api")` reads
+/// `{prefix}/api/`, so a name of `"api/admin"` would read another service's
+/// sub-tree, and a name of `""` or one beginning with `/` widens the scan.
+fn validate_service_name(name: &str) -> Result<(), DiscoveryError> {
+    if name.is_empty() || name.contains('/') || name.chars().any(|c| c.is_control()) {
+        return Err(DiscoveryError::InvalidConfiguration(
+            "service name must be non-empty and contain no '/' or control characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Reject service ids that would escape their key (`{prefix}__idx/{id}`).
+fn validate_service_id(id: &str) -> Result<(), DiscoveryError> {
+    if id.is_empty() || id.contains('/') || id.chars().any(|c| c.is_control()) {
+        return Err(DiscoveryError::InvalidConfiguration(
+            "service id must be non-empty and contain no '/' or control characters".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl EtcdDiscovery {
@@ -83,12 +213,50 @@ impl EtcdDiscovery {
             .map_err(|e| DiscoveryError::InvalidConfiguration(e.to_string()))?;
 
         Ok(Self {
-            base_url: base_url.into(),
+            http: Arc::new(EtcdHttp {
+                base_url: base_url.into(),
+                client,
+                credentials: None,
+                token: tokio::sync::RwLock::new(None),
+            }),
             prefix: prefix.into(),
-            client,
             lease_ttl: DEFAULT_LEASE_TTL,
             registrations: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Authenticate as an etcd user (for clusters with `etcdctl auth enable`).
+    ///
+    /// The credentials are exchanged for a token via `/v3/auth/authenticate`
+    /// on first use; the token is sent in the `Authorization` header of every
+    /// request (including lease keep-alives) and refreshed once on a 401.
+    /// Without credentials, a cluster with auth enabled rejects every call,
+    /// and one without auth lets anyone who can reach it rewrite the service
+    /// registry — enable auth and use this.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// use armature_discovery::EtcdDiscovery;
+    ///
+    /// let etcd = EtcdDiscovery::new("https://etcd.internal:2379", "/services")?
+    ///     .with_credentials("discovery", std::env::var("ETCD_PASSWORD")?);
+    /// ```
+    pub fn with_credentials(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.http = Arc::new(EtcdHttp {
+            base_url: self.http.base_url.clone(),
+            client: self.http.client.clone(),
+            credentials: Some(EtcdCredentials {
+                username: username.into(),
+                password: password.into(),
+            }),
+            token: tokio::sync::RwLock::new(None),
+        });
+        self
     }
 
     /// Set the TTL of the lease attached to future registrations.
@@ -157,7 +325,6 @@ impl EtcdDiscovery {
         &self,
         prefix: &str,
     ) -> Result<Vec<(String, ServiceInstance)>, DiscoveryError> {
-        let url = format!("{}/v3/kv/range", self.base_url);
         let key_b64 = general_purpose::STANDARD.encode(prefix.as_bytes());
         let range_end_b64 = general_purpose::STANDARD.encode(prefix_range_end(prefix.as_bytes()));
 
@@ -166,7 +333,7 @@ impl EtcdDiscovery {
             "range_end": range_end_b64,
         });
 
-        let response = self.client.post(&url).json(&payload).send().await?;
+        let response = self.http.post("/v3/kv/range", &payload).await?;
 
         if !response.status().is_success() {
             return Err(DiscoveryError::InvalidConfiguration(format!(
@@ -189,14 +356,13 @@ impl EtcdDiscovery {
     /// Point-get a single key from etcd, decoding its value as a
     /// `ServiceInstance`. Returns `Ok(None)` if the key doesn't exist.
     async fn get_key(&self, key: &str) -> Result<Option<ServiceInstance>, DiscoveryError> {
-        let url = format!("{}/v3/kv/range", self.base_url);
         let key_b64 = general_purpose::STANDARD.encode(key.as_bytes());
 
         let payload = serde_json::json!({
             "key": key_b64,
         });
 
-        let response = self.client.post(&url).json(&payload).send().await?;
+        let response = self.http.post("/v3/kv/range", &payload).await?;
 
         if !response.status().is_success() {
             return Err(DiscoveryError::InvalidConfiguration(format!(
@@ -221,10 +387,9 @@ impl EtcdDiscovery {
     /// Every operation commits or none does, which is what keeps the two
     /// registration keys from drifting apart.
     async fn txn(&self, operations: Vec<serde_json::Value>) -> Result<(), DiscoveryError> {
-        let url = format!("{}/v3/kv/txn", self.base_url);
         let payload = serde_json::json!({ "success": operations });
 
-        let response = self.client.post(&url).json(&payload).send().await?;
+        let response = self.http.post("/v3/kv/txn", &payload).await?;
         if !response.status().is_success() {
             let error = response
                 .text()
@@ -240,10 +405,9 @@ impl EtcdDiscovery {
 
     /// Grant a lease with the configured TTL, returning its id.
     async fn grant_lease(&self) -> Result<String, DiscoveryError> {
-        let url = format!("{}/v3/lease/grant", self.base_url);
         let payload = serde_json::json!({ "TTL": self.lease_ttl_secs() });
 
-        let response = self.client.post(&url).json(&payload).send().await?;
+        let response = self.http.post("/v3/lease/grant", &payload).await?;
         if !response.status().is_success() {
             let error = response
                 .text()
@@ -272,10 +436,9 @@ impl EtcdDiscovery {
 
     /// Revoke a lease, which atomically removes every key attached to it.
     async fn revoke_lease(&self, lease_id: &str) -> Result<(), DiscoveryError> {
-        let url = format!("{}/v3/lease/revoke", self.base_url);
         let payload = serde_json::json!({ "ID": lease_id });
 
-        let response = self.client.post(&url).json(&payload).send().await?;
+        let response = self.http.post("/v3/lease/revoke", &payload).await?;
         if !response.status().is_success() {
             let error = response
                 .text()
@@ -293,15 +456,14 @@ impl EtcdDiscovery {
     /// registration is alive. Dropping/aborting the task stops the refreshes,
     /// so etcd expires the lease and evicts the registration.
     fn spawn_keep_alive(&self, service_id: String, lease_id: String) -> JoinHandle<()> {
-        let client = self.client.clone();
-        let url = format!("{}/v3/lease/keepalive", self.base_url);
+        let http = Arc::clone(&self.http);
         let interval = self.keep_alive_interval();
         let payload = serde_json::json!({ "ID": lease_id });
 
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                match client.post(&url).json(&payload).send().await {
+                match http.post("/v3/lease/keepalive", &payload).await {
                     Ok(response) if response.status().is_success() => {
                         debug!("Refreshed etcd lease for service {}", service_id);
                     }
@@ -425,6 +587,8 @@ fn prefix_range_end(prefix: &[u8]) -> Vec<u8> {
 #[async_trait]
 impl ServiceDiscovery for EtcdDiscovery {
     async fn register(&self, service: &ServiceInstance) -> Result<(), DiscoveryError> {
+        validate_service_name(&service.name)?;
+        validate_service_id(&service.id)?;
         let composite_key = self.composite_key(&service.name, &service.id);
         let idx_key = self.idx_key(&service.id);
         let value = serde_json::to_string(service)
@@ -480,6 +644,7 @@ impl ServiceDiscovery for EtcdDiscovery {
     }
 
     async fn deregister(&self, service_id: &str) -> Result<(), DiscoveryError> {
+        validate_service_id(service_id)?;
         // If this client registered the service, revoking its lease removes
         // every key attached to it in one etcd operation — no lookup needed,
         // and no window where one key outlives the other.
@@ -510,6 +675,7 @@ impl ServiceDiscovery for EtcdDiscovery {
     }
 
     async fn discover(&self, service_name: &str) -> Result<Vec<ServiceInstance>, DiscoveryError> {
+        validate_service_name(service_name)?;
         let prefix = self.service_name_prefix(service_name);
         let instances: Vec<ServiceInstance> = self
             .scan_prefix(&prefix)
@@ -531,6 +697,7 @@ impl ServiceDiscovery for EtcdDiscovery {
     }
 
     async fn get_service(&self, service_id: &str) -> Result<ServiceInstance, DiscoveryError> {
+        validate_service_id(service_id)?;
         let idx_key = self.idx_key(service_id);
         self.get_key(&idx_key)
             .await?
@@ -918,5 +1085,71 @@ mod tests {
         names.sort();
 
         assert_eq!(names, vec!["api".to_string(), "worker".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn service_names_with_separators_are_rejected_before_any_request() {
+        let server = StubServer::builder()
+            .default_response(StubResponse::json(200, r#"{"kvs":[]}"#))
+            .start()
+            .await;
+        let etcd = EtcdDiscovery::new(server.url(), "/services").unwrap();
+        for name in ["api/admin", "/", "", "api/", "a\u{0}b"] {
+            assert!(
+                matches!(
+                    etcd.discover(name).await,
+                    Err(DiscoveryError::InvalidConfiguration(_))
+                ),
+                "{name:?}"
+            );
+        }
+        for id in ["a/b", ""] {
+            assert!(etcd.get_service(id).await.is_err(), "{id:?}");
+        }
+        let instance = ServiceInstance::new("svc-1", "api/admin", "127.0.0.1", 80);
+        assert!(etcd.register(&instance).await.is_err());
+        assert!(server.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn credentials_are_exchanged_for_a_token_sent_on_requests() {
+        let server = StubServer::builder()
+            .route(
+                "POST",
+                "/v3/auth/authenticate",
+                StubResponse::json(200, r#"{"token":"etcd-token-123"}"#),
+            )
+            .route(
+                "POST",
+                "/v3/kv/range",
+                StubResponse::json(200, r#"{"kvs":[]}"#),
+            )
+            .start()
+            .await;
+        let etcd = EtcdDiscovery::new(server.url(), "/services")
+            .unwrap()
+            .with_credentials("discovery", "hunter2-password");
+        etcd.discover("api").await.unwrap();
+
+        let requests = server.requests();
+        let auth = requests
+            .iter()
+            .find(|r| r.path == "/v3/auth/authenticate")
+            .expect("authenticate call");
+        assert!(auth.body_string().contains("discovery"));
+        let range = requests
+            .iter()
+            .find(|r| r.path == "/v3/kv/range")
+            .expect("range call");
+        assert_eq!(range.header("authorization"), Some("etcd-token-123"));
+    }
+
+    #[test]
+    fn credentials_debug_is_redacted() {
+        let creds = EtcdCredentials {
+            username: "u".into(),
+            password: "hunter2-password".into(),
+        };
+        assert!(!format!("{creds:?}").contains("hunter2"));
     }
 }
