@@ -9,6 +9,27 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-17
+
+### Security
+
+- `ConsulDiscovery::with_acl_token` sends a Consul ACL token
+  (`X-Consul-Token`, marked sensitive) on every request (M41).
+- `EtcdDiscovery::with_credentials` authenticates against etcd v3 auth
+  (`/v3/auth/authenticate`), sends the token on every request including lease
+  keep-alives, and re-authenticates once on a 401. `Debug` of the credentials
+  is redacted (M41).
+- etcd service names containing `/` or control characters (or empty) are
+  rejected: `discover("api/admin")` used to range-scan another service's
+  sub-tree, and `""` widened the scan to every service. Service ids are
+  validated the same way (M41).
+
+### Changed
+
+- **Breaking:** `EtcdDiscovery::{register, discover, get_service, deregister}`
+  return `DiscoveryError::InvalidConfiguration` for such names/ids. Migration:
+  use names without `/`.
+
 ## [0.3.2] - 2026-09-15
 
 ### Changed
