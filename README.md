@@ -54,7 +54,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```rust
 use armature_discovery::ConsulDiscovery;
 
-let consul = ConsulDiscovery::new("http://localhost:8500")?;
+let consul = ConsulDiscovery::new("http://localhost:8500")?
+    // Sent as X-Consul-Token on every request; required when ACLs are enabled.
+    .with_acl_token(std::env::var("CONSUL_HTTP_TOKEN")?)?;
 consul.register(&service).await?;
 let instances = consul.discover("api").await?;
 ```
@@ -70,6 +72,8 @@ use armature_discovery::EtcdDiscovery;
 use std::time::Duration;
 
 let etcd = EtcdDiscovery::new("http://localhost:2379", "/services")?
+    // etcd v3 auth; the token is sent on every request, re-authenticating on 401.
+    .with_credentials("discovery", std::env::var("ETCD_PASSWORD")?)
     .with_lease_ttl(Duration::from_secs(10)); // optional; defaults to 30s
 etcd.register(&service).await?;
 let instances = etcd.discover("api").await?;
@@ -78,7 +82,9 @@ let instances = etcd.discover("api").await?;
 `register` writes both of its keys in a single etcd transaction, attached to a
 lease that a background task keeps alive. If the registering process dies the
 lease expires and etcd drops the registration, so a crashed instance stops
-being discoverable within roughly one TTL. The lease covers liveness only —
+being discoverable within roughly one TTL. Service names and ids may not be empty or
+contain `/` or control characters (`DiscoveryError::InvalidConfiguration`), so one
+service's lookup can never range-scan another's keys. The lease covers liveness only —
 `discover` does not filter on health, and nothing probes instances in the
 background.
 
