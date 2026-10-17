@@ -9,6 +9,8 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-17
+
 ### Security
 
 - `ConsulDiscovery::with_acl_token` sends a Consul ACL token
